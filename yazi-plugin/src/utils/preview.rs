@@ -1,8 +1,8 @@
 use mlua::{AnyUserData, IntoLuaMulti, Lua, Table, Value};
+use yazi_config::PREVIEW;
 use yazi_shared::{emit, event::Cmd, Layer, PeekError};
 
 use super::Utils;
-use yazi_config::PREVIEW;
 use crate::{bindings::{FileRef, Window}, cast_to_renderable, elements::{Paragraph, RectRef, Renderable}, external::{self, Highlighter}};
 
 pub struct PreviewLock {

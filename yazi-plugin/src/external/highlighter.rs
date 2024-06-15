@@ -1,13 +1,12 @@
 use std::{io::Cursor, mem, path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, OnceLock}};
 
 use anyhow::{anyhow, Result};
-use ratatui::text::{Line, Span, Text};
+use ratatui::{prelude::Rect, text::{Line, Span, Text}};
 use syntect::{dumps, easy::HighlightLines, highlighting::{self, Theme, ThemeSet}, parsing::{SyntaxReference, SyntaxSet}};
 use tokio::{fs::File, io::{AsyncBufReadExt, BufReader}};
+use unicode_width::UnicodeWidthStr;
 use yazi_config::{PREVIEW, THEME};
 use yazi_shared::PeekError;
-use ratatui::prelude::Rect;
-use textwrap::wrap as textwrap_wrap;
 
 static INCR: AtomicUsize = AtomicUsize::new(0);
 static SYNTECT_SYNTAX: OnceLock<SyntaxSet> = OnceLock::new();
@@ -58,13 +57,99 @@ impl Highlighter {
 		syntaxes.find_syntax_by_first_line(&line).ok_or_else(|| anyhow!("No syntax found"))
 	}
 
-	pub async fn highlight(&self, skip: usize, area: Rect, wrap: bool) -> Result<Text<'static>, PeekError> {
-		let mut reader = BufReader::new(File::open(&self.path).await?);
+	pub async fn highlight(
+		&self,
+		skip: usize,
+		area: Rect,
+		wrap: bool,
+	) -> Result<Text<'static>, PeekError> {
+		let reader = BufReader::new(File::open(&self.path).await?);
 
 		let syntax = Self::find_syntax(&self.path).await;
 		let mut plain = syntax.is_err();
 
-		let mut before = Vec::with_capacity(if plain { 0 } else { skip });
+		let (before, after): (Vec<String>, Vec<String>);
+		if wrap {
+			(before, after) = Self::before_after_wrapped(skip, area, &mut plain, reader).await?;
+		} else {
+			(before, after) = Self::before_after(skip, area, &mut plain, reader).await?;
+		}
+
+		if plain {
+			Ok(Text::from(after.join("")))
+		} else {
+			Self::highlight_with(before, after, syntax.unwrap()).await
+		}
+	}
+
+	async fn before_after_wrapped(
+		skip: usize,
+		area: Rect,
+		plain: &mut bool,
+		mut reader: BufReader<File>,
+	) -> Result<(Vec<String>, Vec<String>), PeekError> {
+		let mut before = Vec::with_capacity(if *plain { 0 } else { skip });
+		let mut after = Vec::with_capacity(area.height as usize);
+
+		let mut long_lines = vec![];
+		let mut buf = vec![];
+		// If we want to indent plain text, we have to decide if it is plain
+		while reader.read_until(b'\n', &mut buf).await.is_ok() {
+			if buf.is_empty() {
+				break;
+			}
+			if !*plain && buf.len() > 6000 {
+				*plain = true;
+			}
+			long_lines.push(buf.clone());
+			buf.clear()
+		}
+
+		let mut i = 0;
+		for mut long_line in long_lines {
+			if long_line.is_empty() || i > skip + area.height as usize {
+				break;
+			}
+			Self::replace_tabs_with_spaces(&mut long_line, PREVIEW.tab_size as usize);
+			for line in Self::chunk_by_width(long_line, area.width as usize) {
+				let mut line = line.to_vec();
+				i += 1;
+				if line.is_empty() || i > skip + area.height as usize {
+					break;
+				}
+
+				if line.ends_with(b"\r\n") {
+					line.pop();
+					line.pop();
+					line.push(b'\n');
+				} else if !line.ends_with(b"\n") {
+					line.push(b'\n')
+				}
+
+				let text = String::from_utf8_lossy(&line).into_owned();
+				if i > skip {
+					after.push(text);
+				} else if !*plain {
+					before.push(text);
+				}
+			}
+		}
+
+		let no_more_scroll = i < skip + area.height as usize;
+		if skip > 0 && no_more_scroll {
+			return Err(PeekError::Exceed(i.saturating_sub(area.height as usize)));
+		}
+
+		Ok((before, after))
+	}
+
+	async fn before_after(
+		skip: usize,
+		area: Rect,
+		plain: &mut bool,
+		mut reader: BufReader<File>,
+	) -> Result<(Vec<String>, Vec<String>), PeekError> {
+		let mut before = Vec::with_capacity(if *plain { 0 } else { skip });
 		let mut after = Vec::with_capacity(area.height as usize);
 
 		let mut i = 0;
@@ -75,8 +160,8 @@ impl Highlighter {
 				break;
 			}
 
-			if !plain && buf.len() > 6000 {
-				plain = true;
+			if !*plain && buf.len() > 6000 {
+				*plain = true;
 				drop(mem::take(&mut before));
 			}
 
@@ -86,40 +171,58 @@ impl Highlighter {
 				buf.push(b'\n');
 			}
 
-			let line = String::from_utf8_lossy(&buf).into_owned();
-
 			if i > skip {
-				after.push(line);
-			} else if !plain {
-				before.push(line);
+				after.push(String::from_utf8_lossy(&buf).into_owned());
+			} else if !*plain {
+				before.push(String::from_utf8_lossy(&buf).into_owned());
 			}
 			buf.clear();
 		}
 
-		if skip > 0 && i < skip + area.height as usize {
+		let no_more_scroll = i < skip + area.height as usize;
+		if skip > 0 && no_more_scroll {
 			return Err(PeekError::Exceed(i.saturating_sub(area.height as usize)));
 		}
 
-		let indent = " ".repeat(PREVIEW.tab_size as usize);
-		let after_text = after.join("").replace('\t', &indent);
+		Ok((before, after))
+	}
 
-		if plain {
-			let wrapped_text = if wrap {
-				textwrap_wrap(&after_text, area.width as usize).join("\n")
+	fn chunk_by_width(line: Vec<u8>, width: usize) -> Vec<Vec<u8>> {
+		let mut res = vec![];
+		let mut buf = vec![];
+		let mut char_buf = vec![];
+		for b in &line {
+			buf.push(*b);
+			char_buf.push(*b);
+			if String::from_utf8(char_buf.clone()).is_ok() {
+				let buf_width = String::from_utf8_lossy(&buf).width();
+				if buf_width == width {
+					res.push(buf.clone());
+					buf.clear();
+				} else if buf_width > width {
+					buf = buf[..buf.len() - char_buf.len()].to_vec();
+					res.push(buf.clone());
+					buf.clear();
+					buf.extend_from_slice(&char_buf);
+				}
+				char_buf.clear();
+			}
+		}
+		if !buf.is_empty() {
+			res.push(buf);
+		}
+		res
+	}
+
+	fn replace_tabs_with_spaces(buf: &mut Vec<u8>, tab_size: usize) {
+		let mut i = 0;
+		while i < buf.len() {
+			if buf[i] == b'\t' {
+				buf.splice(i..i + 1, vec![b' '; tab_size]);
+				i += tab_size;
 			} else {
-				after_text
-			};
-			Ok(Text::from(wrapped_text))
-		} else {
-			let wrapped_after: Vec<String> = if wrap {
-				textwrap_wrap(&after_text, area.width as usize)
-					.into_iter()
-					.map(|cow| cow.trim_end_matches('\n').to_string())
-					.collect()
-			} else {
-				after
-			};
-			Self::highlight_with(before, wrapped_after, syntax.unwrap()).await
+				i += 1;
+			}
 		}
 	}
 
