@@ -76,6 +76,10 @@ impl Highlighter {
 		}
 
 		if plain {
+			if !wrap {
+				let indent = " ".repeat(PREVIEW.tab_size as usize);
+				return Ok(Text::from(after.join("").replace('\t', &indent)));
+			}
 			Ok(Text::from(after.join("")))
 		} else {
 			Self::highlight_with(before, after, syntax.unwrap()).await
@@ -105,39 +109,33 @@ impl Highlighter {
 			buf.clear()
 		}
 
-		let mut i = 0;
+		let mut lines_handled = 0;
 		for mut long_line in long_lines {
-			if long_line.is_empty() || i > skip + area.height as usize {
+			if long_line.is_empty() || lines_handled > skip + area.height as usize {
 				break;
 			}
 			Self::replace_tabs_with_spaces(&mut long_line, PREVIEW.tab_size as usize);
 			for line in Self::chunk_by_width(long_line, area.width as usize) {
 				let mut line = line.to_vec();
-				i += 1;
-				if line.is_empty() || i > skip + area.height as usize {
+				lines_handled += 1;
+				let must_break = Self::handle_single_line(
+					lines_handled,
+					skip,
+					*plain,
+					area.height as usize,
+					&mut line,
+					&mut before,
+					&mut after,
+				);
+				if must_break {
 					break;
-				}
-
-				if line.ends_with(b"\r\n") {
-					line.pop();
-					line.pop();
-					line.push(b'\n');
-				} else if !line.ends_with(b"\n") {
-					line.push(b'\n')
-				}
-
-				let text = String::from_utf8_lossy(&line).into_owned();
-				if i > skip {
-					after.push(text);
-				} else if !*plain {
-					before.push(text);
 				}
 			}
 		}
 
-		let no_more_scroll = i < skip + area.height as usize;
+		let no_more_scroll = lines_handled < skip + area.height as usize;
 		if skip > 0 && no_more_scroll {
-			return Err(PeekError::Exceed(i.saturating_sub(area.height as usize)));
+			return Err(PeekError::Exceed(lines_handled.saturating_sub(area.height as usize)));
 		}
 
 		Ok((before, after))
@@ -152,39 +150,65 @@ impl Highlighter {
 		let mut before = Vec::with_capacity(if *plain { 0 } else { skip });
 		let mut after = Vec::with_capacity(area.height as usize);
 
-		let mut i = 0;
+		let mut lines_handled = 0;
 		let mut buf = vec![];
 		while reader.read_until(b'\n', &mut buf).await.is_ok() {
-			i += 1;
-			if buf.is_empty() || i > skip + area.height as usize {
-				break;
-			}
-
+			lines_handled += 1;
 			if !*plain && buf.len() > 6000 {
 				*plain = true;
 				drop(mem::take(&mut before));
 			}
-
-			if buf.ends_with(b"\r\n") {
-				buf.pop();
-				buf.pop();
-				buf.push(b'\n');
-			}
-
-			if i > skip {
-				after.push(String::from_utf8_lossy(&buf).into_owned());
-			} else if !*plain {
-				before.push(String::from_utf8_lossy(&buf).into_owned());
+			let must_break = Self::handle_single_line(
+				lines_handled,
+				skip,
+				*plain,
+				area.height as usize,
+				&mut buf,
+				&mut before,
+				&mut after,
+			);
+			if must_break {
+				break;
 			}
 			buf.clear();
 		}
 
-		let no_more_scroll = i < skip + area.height as usize;
+		let no_more_scroll = lines_handled < skip + area.height as usize;
 		if skip > 0 && no_more_scroll {
-			return Err(PeekError::Exceed(i.saturating_sub(area.height as usize)));
+			return Err(PeekError::Exceed(lines_handled.saturating_sub(area.height as usize)));
 		}
 
 		Ok((before, after))
+	}
+
+	fn handle_single_line(
+		lines_handled: usize,
+		skip: usize,
+		plain: bool,
+		limit: usize,
+		line: &mut Vec<u8>,
+		before: &mut Vec<String>,
+		after: &mut Vec<String>,
+	) -> bool {
+		if line.is_empty() || lines_handled > skip + limit {
+			return true;
+		}
+
+		if line.ends_with(b"\r\n") {
+			line.pop();
+			line.pop();
+			line.push(b'\n');
+		} else if !line.ends_with(b"\n") {
+			line.push(b'\n')
+		}
+
+		let text = String::from_utf8_lossy(&line).into_owned();
+		if lines_handled > skip {
+			after.push(text);
+		} else if !plain {
+			before.push(text);
+		}
+		false
 	}
 
 	fn chunk_by_width(line: Vec<u8>, width: usize) -> Vec<Vec<u8>> {
