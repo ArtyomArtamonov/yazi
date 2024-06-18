@@ -12,6 +12,8 @@ static INCR: AtomicUsize = AtomicUsize::new(0);
 static SYNTECT_SYNTAX: OnceLock<SyntaxSet> = OnceLock::new();
 static SYNTECT_THEME: OnceLock<Theme> = OnceLock::new();
 
+const MAX_LINE_BYTES_TO_PLAINTEXT_FALLBACK: usize = 6000;
+
 pub struct Highlighter {
 	path: PathBuf,
 }
@@ -102,7 +104,7 @@ impl Highlighter {
 			if buf.is_empty() {
 				break;
 			}
-			if !*plain && buf.len() > 6000 {
+			if !*plain && buf.len() > MAX_LINE_BYTES_TO_PLAINTEXT_FALLBACK {
 				*plain = true;
 			}
 			long_lines.push(buf.clone());
@@ -154,7 +156,7 @@ impl Highlighter {
 		let mut buf = vec![];
 		while reader.read_until(b'\n', &mut buf).await.is_ok() {
 			lines_handled += 1;
-			if !*plain && buf.len() > 6000 {
+			if !*plain && buf.len() > MAX_LINE_BYTES_TO_PLAINTEXT_FALLBACK {
 				*plain = true;
 				drop(mem::take(&mut before));
 			}
@@ -202,7 +204,7 @@ impl Highlighter {
 			line.push(b'\n')
 		}
 
-		let text = String::from_utf8_lossy(&line).into_owned();
+		let text = String::from_utf8_lossy(line).into_owned();
 		if lines_handled > skip {
 			after.push(text);
 		} else if !plain {
@@ -212,30 +214,69 @@ impl Highlighter {
 	}
 
 	fn chunk_by_width(line: Vec<u8>, width: usize) -> Vec<Vec<u8>> {
-		let mut res = vec![];
-		let mut buf = vec![];
-		let mut char_buf = vec![];
-		for b in &line {
-			buf.push(*b);
-			char_buf.push(*b);
-			if String::from_utf8(char_buf.clone()).is_ok() {
-				let buf_width = String::from_utf8_lossy(&buf).width();
-				if buf_width == width {
-					res.push(buf.clone());
-					buf.clear();
-				} else if buf_width > width {
-					buf = buf[..buf.len() - char_buf.len()].to_vec();
-					res.push(buf.clone());
-					buf.clear();
-					buf.extend_from_slice(&char_buf);
+		if String::from_utf8_lossy(&line).width() <= width {
+			return vec![line];
+		}
+
+		let mut resulted_lines = vec![];
+		let mut buf_line = vec![];
+		let mut buf_char = vec![];
+		let mut last_break_char_idx = 0;
+		let mut last_break_idx = 0;
+		for (i, byte) in line.iter().enumerate() {
+			let byte = *byte;
+
+			buf_line.push(byte);
+			buf_char.push(byte);
+
+			if let Ok(char) = String::from_utf8(buf_char.clone()) {
+				if ",.; ".contains(&char) {
+					last_break_char_idx = i + 1
 				}
-				char_buf.clear();
+
+				let buf_line_width = String::from_utf8_lossy(&buf_line).width();
+				if buf_line_width < width {
+					buf_char.clear();
+					continue;
+				}
+
+				if last_break_char_idx == 0 {
+					// no spaces in line, break right here
+					match buf_line_width.cmp(&width) {
+						std::cmp::Ordering::Equal => {
+							resulted_lines.push(buf_line.clone());
+							buf_line.clear();
+							last_break_idx = i + 1;
+						}
+						std::cmp::Ordering::Greater => {
+							let take_bytes = buf_line.len() - buf_char.len();
+							buf_line = buf_line[..take_bytes].to_vec();
+							resulted_lines.push(buf_line.clone());
+							buf_line.clear();
+							buf_line.extend_from_slice(&buf_char);
+							last_break_idx = i - take_bytes + 1;
+						}
+						_ => {}
+					}
+				} else {
+					let break_idx = last_break_char_idx - last_break_idx;
+					resulted_lines.push(buf_line[..break_idx].to_vec());
+					buf_line = if last_break_char_idx == buf_line.len() {
+						vec![]
+					} else {
+						buf_line[break_idx..].to_vec()
+					};
+					last_break_idx = last_break_char_idx;
+				}
+				last_break_char_idx = 0;
+				buf_char.clear();
 			}
 		}
-		if !buf.is_empty() {
-			res.push(buf);
+		if !buf_line.is_empty() && String::from_utf8_lossy(&buf_line) != "\n" {
+			resulted_lines.push(buf_line);
 		}
-		res
+
+		resulted_lines
 	}
 
 	fn replace_tabs_with_spaces(buf: &mut Vec<u8>, tab_size: usize) {
