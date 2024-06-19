@@ -107,7 +107,7 @@ impl Highlighter {
 			if !*plain && buf.len() > MAX_LINE_BYTES_TO_PLAINTEXT_FALLBACK {
 				*plain = true;
 			}
-			long_lines.push(buf.clone());
+			long_lines.push(mem::take(&mut buf));
 			buf.clear()
 		}
 
@@ -118,14 +118,13 @@ impl Highlighter {
 			}
 			Self::replace_tabs_with_spaces(&mut long_line, PREVIEW.tab_size as usize);
 			for line in Self::chunk_by_width(long_line, area.width as usize) {
-				let mut line = line.to_vec();
 				lines_handled += 1;
 				let must_break = Self::handle_single_line(
 					lines_handled,
 					skip,
 					*plain,
 					area.height as usize,
-					&mut line,
+					line,
 					&mut before,
 					&mut after,
 				);
@@ -165,7 +164,7 @@ impl Highlighter {
 				skip,
 				*plain,
 				area.height as usize,
-				&mut buf,
+				String::from_utf8_lossy(&buf).to_string(),
 				&mut before,
 				&mut after,
 			);
@@ -188,7 +187,7 @@ impl Highlighter {
 		skip: usize,
 		plain: bool,
 		limit: usize,
-		line: &mut Vec<u8>,
+		mut line: String,
 		before: &mut Vec<String>,
 		after: &mut Vec<String>,
 	) -> bool {
@@ -196,83 +195,87 @@ impl Highlighter {
 			return true;
 		}
 
-		if line.ends_with(b"\r\n") {
-			line.pop();
-			line.pop();
-			line.push(b'\n');
-		} else if !line.ends_with(b"\n") {
-			line.push(b'\n')
+		if line.as_str().ends_with("\r\n") {
+			let mut chars = line.chars();
+			chars.next_back();
+			chars.next_back();
+			line = chars.as_str().to_string();
+		} else if !line.as_str().ends_with('\n') {
+			line.push('\n')
 		}
 
-		let text = String::from_utf8_lossy(line).into_owned();
 		if lines_handled > skip {
-			after.push(text);
+			after.push(line);
 		} else if !plain {
-			before.push(text);
+			before.push(line);
 		}
 		false
 	}
 
-	fn chunk_by_width(line: Vec<u8>, width: usize) -> Vec<Vec<u8>> {
-		if String::from_utf8_lossy(&line).width() <= width {
-			return vec![line];
+	fn chunk_by_width(line: Vec<u8>, width: usize) -> Vec<String> {
+		let line = String::from_utf8_lossy(&line);
+		if line.width() <= width {
+			return vec![line.to_string()];
 		}
 
 		let mut resulted_lines = vec![];
-		let mut buf_line = vec![];
-		let mut buf_char = vec![];
+		// Use this buffer to calculate width
+		let mut buf_line = String::with_capacity(width);
+		// Use this buffer to slice line
+		let mut buf_chars = Vec::with_capacity(width);
 		let mut last_break_char_idx = 0;
 		let mut last_break_idx = 0;
-		for (i, byte) in line.iter().enumerate() {
-			let byte = *byte;
+		for (i, char) in line.chars().enumerate() {
+			buf_line.push(char);
+			buf_chars.push(char);
 
-			buf_line.push(byte);
-			buf_char.push(byte);
-
-			if let Ok(char) = String::from_utf8(buf_char.clone()) {
-				if ",.; ".contains(&char) {
-					last_break_char_idx = i + 1
-				}
-
-				let buf_line_width = String::from_utf8_lossy(&buf_line).width();
-				if buf_line_width < width {
-					buf_char.clear();
-					continue;
-				}
-
-				if last_break_char_idx == 0 {
-					// no spaces in line, break right here
-					match buf_line_width.cmp(&width) {
-						std::cmp::Ordering::Equal => {
-							resulted_lines.push(buf_line.clone());
-							buf_line.clear();
-							last_break_idx = i + 1;
-						}
-						std::cmp::Ordering::Greater => {
-							let take_bytes = buf_line.len() - buf_char.len();
-							buf_line = buf_line[..take_bytes].to_vec();
-							resulted_lines.push(buf_line.clone());
-							buf_line.clear();
-							buf_line.extend_from_slice(&buf_char);
-							last_break_idx = i - take_bytes + 1;
-						}
-						_ => {}
-					}
-				} else {
-					let break_idx = last_break_char_idx - last_break_idx;
-					resulted_lines.push(buf_line[..break_idx].to_vec());
-					buf_line = if last_break_char_idx == buf_line.len() {
-						vec![]
-					} else {
-						buf_line[break_idx..].to_vec()
-					};
-					last_break_idx = last_break_char_idx;
-				}
-				last_break_char_idx = 0;
-				buf_char.clear();
+			if ",.; ".contains(char) {
+				last_break_char_idx = i + 1
 			}
+
+			let buf_line_width = buf_line.width();
+			if buf_line_width < width {
+				continue;
+			}
+
+			if last_break_char_idx == 0 {
+				// no spaces in line, break right here
+				match buf_line_width.cmp(&width) {
+					std::cmp::Ordering::Equal => {
+						resulted_lines.push(mem::take(&mut buf_line));
+						last_break_idx = i + 1;
+
+						buf_line = String::with_capacity(width);
+						buf_chars = Vec::with_capacity(width);
+					}
+					std::cmp::Ordering::Greater => {
+						let last_idx = buf_line.len() - char.len_utf8();
+						buf_line = buf_line[..last_idx].to_string();
+						resulted_lines.push(mem::take(&mut buf_line));
+						last_break_idx = i - last_idx + 1;
+
+						buf_line = String::with_capacity(width);
+						buf_line.push(char);
+						buf_chars = Vec::with_capacity(width);
+						buf_chars.push(char);
+					}
+					_ => {}
+				}
+			} else {
+				let break_idx = last_break_char_idx - last_break_idx;
+				resulted_lines.push(buf_chars[..break_idx].iter().collect());
+				last_break_idx = last_break_char_idx;
+
+				buf_chars = if last_break_char_idx == buf_chars.len() {
+					Vec::with_capacity(width)
+				} else {
+					buf_chars[break_idx..].to_vec()
+				};
+				buf_line = buf_chars.iter().collect();
+			}
+			last_break_char_idx = 0;
 		}
-		if !buf_line.is_empty() && String::from_utf8_lossy(&buf_line) != "\n" {
+		if !buf_line.is_empty() && buf_line != "\n" {
 			resulted_lines.push(buf_line);
 		}
 
