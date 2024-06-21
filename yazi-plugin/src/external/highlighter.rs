@@ -65,121 +65,85 @@ impl Highlighter {
 		area: Rect,
 		wrap: bool,
 	) -> Result<Text<'static>, PeekError> {
-		let reader = BufReader::new(File::open(&self.path).await?);
+		let mut reader = BufReader::new(File::open(&self.path).await?);
 
 		let syntax = Self::find_syntax(&self.path).await;
 		let mut plain = syntax.is_err();
 
-		let (before, after): (Vec<String>, Vec<String>);
-		if wrap {
-			(before, after) = Self::before_after_wrapped(skip, area, &mut plain, reader).await?;
-		} else {
-			(before, after) = Self::before_after(skip, area, &mut plain, reader).await?;
+		let mut before = Vec::with_capacity(if plain { 0 } else { skip });
+		let mut after = Vec::with_capacity(area.height as usize);
+
+		let mut lines_handled = 0;
+		let mut long_line = vec![];
+		while reader.read_until(b'\n', &mut long_line).await.is_ok() {
+			if long_line.is_empty() || lines_handled > skip + area.height as usize {
+				break;
+			}
+			if !plain && long_line.len() > MAX_LINE_BYTES_TO_PLAINTEXT_FALLBACK {
+				plain = true;
+				drop(mem::take(&mut before));
+			}
+			Self::replace_tabs_with_spaces(&mut long_line, PREVIEW.tab_size as usize);
+			if wrap {
+				Self::handle_line_wrap(
+					&long_line,
+					area,
+					plain,
+					skip,
+					&mut lines_handled,
+					&mut before,
+					&mut after,
+				);
+			} else {
+				lines_handled += 1;
+				Self::handle_single_line(
+					lines_handled,
+					skip,
+					plain,
+					area.height as usize,
+					String::from_utf8_lossy(&long_line).to_string(),
+					&mut before,
+					&mut after,
+				);
+			}
+			long_line.clear();
 		}
 
+		let no_more_scroll = lines_handled < skip + area.height as usize;
+		if skip > 0 && no_more_scroll {
+			return Err(PeekError::Exceed(lines_handled.saturating_sub(area.height as usize)));
+		}
 		if plain {
-			if !wrap {
-				let indent = " ".repeat(PREVIEW.tab_size as usize);
-				return Ok(Text::from(after.join("").replace('\t', &indent)));
-			}
 			Ok(Text::from(after.join("")))
 		} else {
 			Self::highlight_with(before, after, syntax.unwrap()).await
 		}
 	}
 
-	async fn before_after_wrapped(
-		skip: usize,
+	fn handle_line_wrap(
+		long_line: &[u8],
 		area: Rect,
-		plain: &mut bool,
-		mut reader: BufReader<File>,
-	) -> Result<(Vec<String>, Vec<String>), PeekError> {
-		let mut before = Vec::with_capacity(if *plain { 0 } else { skip });
-		let mut after = Vec::with_capacity(area.height as usize);
-
-		let mut long_lines = vec![];
-		let mut buf = vec![];
-		// If we want to indent plain text, we have to decide if it is plain
-		while reader.read_until(b'\n', &mut buf).await.is_ok() {
-			if buf.is_empty() {
-				break;
-			}
-			if !*plain && buf.len() > MAX_LINE_BYTES_TO_PLAINTEXT_FALLBACK {
-				*plain = true;
-			}
-			long_lines.push(mem::take(&mut buf));
-			buf.clear()
-		}
-
-		let mut lines_handled = 0;
-		for mut long_line in long_lines {
-			if long_line.is_empty() || lines_handled > skip + area.height as usize {
-				break;
-			}
-			Self::replace_tabs_with_spaces(&mut long_line, PREVIEW.tab_size as usize);
-			for line in Self::chunk_by_width(long_line, area.width as usize) {
-				lines_handled += 1;
-				let must_break = Self::handle_single_line(
-					lines_handled,
-					skip,
-					*plain,
-					area.height as usize,
-					line,
-					&mut before,
-					&mut after,
-				);
-				if must_break {
-					break;
-				}
-			}
-		}
-
-		let no_more_scroll = lines_handled < skip + area.height as usize;
-		if skip > 0 && no_more_scroll {
-			return Err(PeekError::Exceed(lines_handled.saturating_sub(area.height as usize)));
-		}
-
-		Ok((before, after))
-	}
-
-	async fn before_after(
+		plain: bool,
 		skip: usize,
-		area: Rect,
-		plain: &mut bool,
-		mut reader: BufReader<File>,
-	) -> Result<(Vec<String>, Vec<String>), PeekError> {
-		let mut before = Vec::with_capacity(if *plain { 0 } else { skip });
-		let mut after = Vec::with_capacity(area.height as usize);
-
-		let mut lines_handled = 0;
-		let mut buf = vec![];
-		while reader.read_until(b'\n', &mut buf).await.is_ok() {
-			lines_handled += 1;
-			if !*plain && buf.len() > MAX_LINE_BYTES_TO_PLAINTEXT_FALLBACK {
-				*plain = true;
-				drop(mem::take(&mut before));
-			}
+		lines_handled: &mut usize,
+		before: &mut Vec<String>,
+		after: &mut Vec<String>,
+	) {
+		for line in Self::chunk_by_width(long_line, area.width as usize) {
+			*lines_handled += 1;
 			let must_break = Self::handle_single_line(
-				lines_handled,
+				*lines_handled,
 				skip,
-				*plain,
+				plain,
 				area.height as usize,
-				String::from_utf8_lossy(&buf).to_string(),
-				&mut before,
-				&mut after,
+				line,
+				before,
+				after,
 			);
 			if must_break {
 				break;
 			}
-			buf.clear();
 		}
-
-		let no_more_scroll = lines_handled < skip + area.height as usize;
-		if skip > 0 && no_more_scroll {
-			return Err(PeekError::Exceed(lines_handled.saturating_sub(area.height as usize)));
-		}
-
-		Ok((before, after))
 	}
 
 	fn handle_single_line(
@@ -195,13 +159,12 @@ impl Highlighter {
 			return true;
 		}
 
-		if line.as_str().ends_with("\r\n") {
-			let mut chars = line.chars();
-			chars.next_back();
-			chars.next_back();
-			line = chars.as_str().to_string();
-		} else if !line.as_str().ends_with('\n') {
-			line.push('\n')
+		if line.ends_with("\r\n") {
+			line.pop();
+			line.pop();
+			line.push('\n');
+		} else if !line.ends_with('\n') {
+			line.push('\n');
 		}
 
 		if lines_handled > skip {
@@ -212,8 +175,8 @@ impl Highlighter {
 		false
 	}
 
-	fn chunk_by_width(line: Vec<u8>, width: usize) -> Vec<String> {
-		let line = String::from_utf8_lossy(&line);
+	fn chunk_by_width(line: &[u8], width: usize) -> Vec<String> {
+		let line = String::from_utf8_lossy(line);
 		if line.width() <= width {
 			return vec![line.to_string()];
 		}
